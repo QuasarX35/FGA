@@ -7,8 +7,10 @@ name: Sync upstream FGA
 #                draft PR instead of master. Nothing reaches master until you
 #                review and merge that PR.
 #
-# The workflow uses the repository's GITHUB_TOKEN, so its pushes do not trigger
-# this workflow again (GitHub suppresses workflow runs for GITHUB_TOKEN events).
+# This variant pushes with a PAT (secret SYNC_TOKEN) so it can update upstream
+# workflow files too. PAT pushes normally trigger workflows, so clean merge
+# commits carry [skip ci] to suppress all push-triggered workflows (including
+# this one). The [skip-sync] marker and job condition are a second guard.
 
 on:
   schedule:
@@ -35,6 +37,7 @@ env:
 
 jobs:
   sync:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip-sync]')
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -45,6 +48,7 @@ jobs:
           ref: master
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -90,15 +94,19 @@ jobs:
         id: merge
         if: steps.upstream.outputs.ahead == 'true' && steps.pending.outputs.open != 'true'
         run: |
+          # SYNC_TOKEN has Contents + Workflows write, so unlike GITHUB_TOKEN it
+          # may push upstream workflow-file updates.
           set +e
-          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git merge --no-commit --no-ff "upstream/$UPSTREAM_BRANCH"
           rc=$?
           set -e
 
           if [ "$rc" -eq 0 ]; then
+            git commit --allow-empty -m "Merge upstream FGA master [skip ci] [skip-sync]" \
+              -m "Upstream commit: $UPSTREAM_SHA"
             git push origin "HEAD:$FORK_BRANCH"
             echo "clean=true" >> "$GITHUB_OUTPUT"
-            echo "Merged upstream \`$UPSTREAM_SHA\` into \`$FORK_BRANCH\` with a clean merge and pushed it." >> "$GITHUB_STEP_SUMMARY"
+            echo "Merged upstream \`$UPSTREAM_SHA\` into \`$FORK_BRANCH\` and pushed it." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -135,7 +143,7 @@ jobs:
           git switch -c "$BRANCH"
 
           set +e
-          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git merge --no-commit --no-ff "upstream/$UPSTREAM_BRANCH"
           rc=$?
           set -e
 
@@ -173,7 +181,7 @@ jobs:
           fi
 
           git add -A
-          git commit -m "Merge upstream FGA master (AI-resolved conflicts)" \
+          git commit --allow-empty -m "Merge upstream FGA master (AI-resolved conflicts)" \
             -m "Upstream commit: $UPSTREAM_SHA"
           git push --set-upstream origin "$BRANCH"
 
@@ -190,7 +198,11 @@ jobs:
             echo "> [!IMPORTANT]"
             echo "> Merge this PR with a **merge commit**, not Squash or Rebase. The upstream merge parent must stay in history or future syncs will see the same commits as unmerged."
             echo
-            cat "$REPORT"
+            if [ -f "$REPORT" ]; then
+              cat "$REPORT"
+            else
+              echo "No model calls were needed; only protected workflow-file conflicts remained."
+            fi
             echo
             echo "## Review locally"
             echo
