@@ -1,0 +1,216 @@
+name: Sync upstream FGA
+
+# Keeps this fork's master branch up to date with Fate-Grand-Automata/FGA.
+#
+# - No conflicts: upstream is merged and pushed to master automatically.
+# - Conflicts:   DeepSeek proposes a resolution, and the result is pushed to a
+#                draft PR instead of master. Nothing reaches master until you
+#                review and merge that PR.
+#
+# The workflow uses the repository's GITHUB_TOKEN, so its pushes do not trigger
+# this workflow again (GitHub suppresses workflow runs for GITHUB_TOKEN events).
+
+on:
+  schedule:
+    # GitHub may delay scheduled runs during busy periods. Adjust as desired.
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-fga
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: "https://github.com/Fate-Grand-Automata/FGA.git"
+  UPSTREAM_BRANCH: "master"
+  FORK_BRANCH: "master"
+  DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-flash' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config merge.conflictStyle zdiff3
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          echo "UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")" >> "$GITHUB_ENV"
+
+      - name: Is upstream ahead?
+        id: upstream
+        run: |
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "ahead=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream is already merged into \`$FORK_BRANCH\`; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ahead=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for an open AI sync PR
+        id: pending
+        if: steps.upstream.outputs.ahead == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title \
+            --jq '[.[] | select(.title | startswith("[ai-sync]"))][0].number // empty')
+
+          if [ -n "$number" ]; then
+            echo "open=true" >> "$GITHUB_OUTPUT"
+            echo "An AI sync PR is already open: #$number. Skipping this run so master does not drift while it is under review." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Open AI sync PR #$number exists; skipping this run."
+          else
+            echo "open=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.upstream.outputs.ahead == 'true' && steps.pending.outputs.open != 'true'
+        run: |
+          set +e
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            git push origin "HEAD:$FORK_BRANCH"
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            echo "Merged upstream \`$UPSTREAM_SHA\` into \`$FORK_BRANCH\` with a clean merge and pushed it." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            git merge --abort 2>/dev/null || git reset --hard HEAD
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream merge has conflicts. Asking DeepSeek to draft a resolution." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::git merge failed for a non-conflict reason (exit $rc)."
+          git merge --abort 2>/dev/null || true
+          exit "$rc"
+
+      - name: Resolve conflicts with DeepSeek and open a draft PR
+        if: steps.merge.outputs.clean == 'false'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "::error::DEEPSEEK_API_KEY is not set. Add it under Settings > Secrets and variables > Actions."
+            echo "The upstream merge has conflicts, but no DeepSeek API key is available." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          BRANCH="ai/upstream-sync-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "AI_SYNC_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+          # Re-create the conflicting merge on a throwaway branch. Nothing is
+          # pushed to master from here.
+          git switch -c "$BRANCH"
+
+          set +e
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::Expected a conflicting merge on the AI branch, but the merge was clean. Re-run the workflow."
+            exit 1
+          fi
+
+          if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Merge failed without unmerged paths (exit $rc)."
+            exit "$rc"
+          fi
+
+          REPORT="$RUNNER_TEMP/ai-merge-report.md"
+
+          set +e
+          python3 .github/scripts/deepseek_merge.py --repo . --report "$REPORT"
+          rc=$?
+          set -e
+
+          if [ -f "$REPORT" ]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            git merge --abort 2>/dev/null || git reset --hard HEAD
+            echo "::error::DeepSeek did not resolve every conflict. master was left untouched; see the run summary for details."
+            exit "$rc"
+          fi
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            git merge --abort 2>/dev/null || git reset --hard HEAD
+            echo "::error::Unmerged paths remain after DeepSeek resolution."
+            exit 1
+          fi
+
+          git add -A
+          git commit -m "Merge upstream FGA master (AI-resolved conflicts)" \
+            -m "Upstream commit: $UPSTREAM_SHA"
+          git push --set-upstream origin "$BRANCH"
+
+          {
+            echo "# AI-resolved upstream merge"
+            echo
+            echo "- Upstream commit: \`$UPSTREAM_SHA\`"
+            echo "- Branch: \`$BRANCH\`"
+            echo "- Generated by: \`.github/workflows/fga-sync.yml\`"
+            echo
+            echo "> [!WARNING]"
+            echo "> This merge was drafted by a language model. Review the diff and run the Android build/tests before merging."
+            echo
+            echo "> [!IMPORTANT]"
+            echo "> Merge this PR with a **merge commit**, not Squash or Rebase. The upstream merge parent must stay in history or future syncs will see the same commits as unmerged."
+            echo
+            cat "$REPORT"
+            echo
+            echo "## Review locally"
+            echo
+            echo '```bash'
+            echo "git fetch origin"
+            echo "git switch $BRANCH"
+            echo "./gradlew test"
+            echo "./gradlew assembleCi"
+            echo '```'
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          PR_TITLE="[ai-sync] Merge upstream FGA $(date -u +%Y-%m-%d) (${UPSTREAM_SHA:0:7})"
+          pr_url=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$FORK_BRANCH" \
+            --head "$BRANCH" \
+            --draft \
+            --title "$PR_TITLE" \
+            --body-file "$RUNNER_TEMP/pr-body.md")
+
+          echo "### Draft pull request" >> "$GITHUB_STEP_SUMMARY"
+          echo "$pr_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Opened draft AI merge PR: $pr_url"
